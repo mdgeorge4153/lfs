@@ -1,3 +1,4 @@
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -14,7 +15,7 @@ void fail(char *msg);
 
 #define SEGMENT_NUMBER_BITS 16
 #define BLOCK_NUMBER_BITS   10
-#define BLOCK_OFFSET_BITS   10
+#define BLOCK_OFFSET_BITS   12
 #define INODE_NUMBER_BITS   24
 
 #define SEGMENTS_PER_DISK  (1 << SEGMENT_NUMBER_BITS)
@@ -29,7 +30,7 @@ void fail(char *msg);
  * and block within that segment
  */
 typedef struct block_addr {
-	bool non_null;
+	bool non_null        : 1;
 	unsigned int segment : SEGMENT_NUMBER_BITS;
 	unsigned int block   : BLOCK_NUMBER_BITS;
 } block_addr_t;
@@ -50,7 +51,7 @@ typedef struct block_addr {
 
 
 typedef struct block_id {
-	bool non_null;
+	bool non_null       : 1;
 	unsigned char depth : 3;
 	unsigned char layers[7]; // inode # / inode # / inode # / triple # / double # / single # / data #
 } block_id_t;
@@ -123,7 +124,7 @@ void sync() {
 	mprotect(&the_disk->segments[next_segment], sizeof(segment_t), PROT_READ);
 
 	// update the superblock
-	mprotect(&the_disk->superblock, sizeof(superblock_t), PROT_READ | PROT_WRITE);
+	int result = mprotect(&the_disk->superblock, sizeof(superblock_t), PROT_READ | PROT_WRITE);
 	the_disk->superblock.current_segment = next_segment;
 	msync(&the_disk->superblock, sizeof(superblock_t), MS_ASYNC);
 	mprotect(&the_disk->superblock, sizeof(superblock_t), PROT_READ);
@@ -148,13 +149,13 @@ void sync() {
 }
 
 void initialize(char *disk_name, bool format) {
-	int fd = open(disk_name, O_CREAT);
-	the_disk = mmap(NULL, sizeof(disk_t), PROT_READ, MAP_SHARED, fd, 0);
+	int fd = open(disk_name, O_CREAT | O_RDWR, 00600);
+	the_disk = mmap(NULL, sizeof(disk_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
 	if (format)
-		the_disk->superblock.current_segment = SEGMENTS_PER_DISK - 1;
-
-	next_segment = the_disk->superblock.current_segment;
+		next_segment = SEGMENTS_PER_DISK - 1;
+	else
+		next_segment = the_disk->superblock.current_segment;
 	sync();
 }
 
@@ -306,6 +307,7 @@ block_id_t datanum_to_block_id(inode_num_t inode, unsigned long block_num) {
 
 /** User API ******************************************************************/
 
+/*
 void create(inode_num_t file, long size) {
 
 }
@@ -324,6 +326,14 @@ void write(inode_num_t file, long offset, long length, char buffer[length]) {
 
 void delete(inode_num_t file) {
 
+}
+
+*/
+
+int main (int argc, char** argv) {
+	printf("page size: %li\n", sysconf(_SC_PAGE_SIZE));
+	initialize("disk.lfs", true);
+	return 0;
 }
 
 /** IO ************************************************************************/
