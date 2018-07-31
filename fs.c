@@ -137,8 +137,8 @@ void sync() {
 	mprotect(&the_disk->segments[next_segment], sizeof(segment_t), PROT_READ | PROT_WRITE);
 	
 	// copy in inode map root
-	memcpy(&the_disk->segments[old_segment].blocks[0],
-	       &the_disk->segments[next_segment].blocks[0],
+	memcpy(&the_disk->segments[next_segment].blocks[0],
+	       &the_disk->segments[old_segment].blocks[0],
 	       sizeof(data_block_t));
 
 	// set up segment table
@@ -150,6 +150,9 @@ void sync() {
 
 void initialize(char *disk_name, bool format) {
 	int fd = open(disk_name, O_CREAT | O_RDWR, 00600);
+	lseek(fd, sizeof(disk_t) - 1, SEEK_SET);
+	write(fd, "", 1);
+
 	the_disk = mmap(NULL, sizeof(disk_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
 	if (format)
@@ -221,7 +224,7 @@ block_addr_t find(block_id_t id, bool touch) {
 	new_block.segment = next_segment;
 	new_block.block   = next_block++;
 	if (result.non_null)
-		memcpy(lookup(result), lookup(new_block), sizeof(data_block_t));
+		memcpy(lookup(new_block), lookup(result), sizeof(data_block_t));
 	else
 		memset(lookup(new_block), 0, sizeof(data_block_t));
 	lookup_indirect(parent)[id.layers[id.depth]] = new_block;
