@@ -26,17 +26,6 @@ void fail(char *msg);
 /** Logical and physical addresses ********************************************/
 
 /**
- * A block_addr is a physical address on disk: it indicates a segment number
- * and block within that segment
- */
-typedef struct block_addr {
-	bool non_null        : 1;
-	unsigned int segment : SEGMENT_NUMBER_BITS;
-	unsigned int block   : BLOCK_NUMBER_BITS;
-} block_addr_t;
-
-
-/**
  * A block_id is a logical address within the filesystem.
  *
  * For example, a block might be the 42nd direct block pointed to by the second
@@ -70,6 +59,10 @@ bool block_id_eq(block_id_t a, block_id_t b) {
 	return true;
 }
 
+block_id_t parent_id(block_id_t addr) {
+	addr.depth--;
+	return addr;
+}
 
 /** Disk organization *********************************************************/
 
@@ -78,10 +71,9 @@ bool block_id_eq(block_id_t a, block_id_t b) {
  * segment contains a bunch of blocks and a segment table.
  */
 
-#define ADDRS_PER_BLOCK (BYTES_PER_BLOCK/sizeof(block_addr_t))
-
-typedef char          data_block_t[BYTES_PER_BLOCK];
-typedef block_addr_t indir_block_t[ADDRS_PER_BLOCK];
+typedef union block {
+	char bytes[BYTES_PER_BLOCK];
+} block_t;
 
 typedef struct superblock {
 	unsigned int current_segment : SEGMENT_NUMBER_BITS;
@@ -92,14 +84,18 @@ typedef struct superblock {
  * inode map (i.e. segment_table[0].depth = 0)
  */
 typedef struct segment {
-	block_id_t   segment_table [BLOCKS_PER_SEGMENT];
-	data_block_t blocks        [BLOCKS_PER_SEGMENT];
+	block_id_t segment_table [BLOCKS_PER_SEGMENT];
+	block_t    blocks        [BLOCKS_PER_SEGMENT];
 } segment_t;
 
 typedef struct disk {
 	segment_t    segments[SEGMENTS_PER_DISK];
 	superblock_t superblock;
 } disk_t;
+
+disk_t       *the_disk;
+unsigned int next_block;
+unsigned int next_segment;
 
 /** Managing the data on the actual disk **************************************/ 
 
@@ -114,19 +110,15 @@ typedef struct disk {
  * the append-only discipline.
  */
 
-disk_t       *the_disk;
-unsigned int  next_segment;
-unsigned int  next_block;
-
 void sync() {
 	// write current segment 
 	msync(&the_disk->segments[next_segment], sizeof(segment_t), MS_SYNC);
 	mprotect(&the_disk->segments[next_segment], sizeof(segment_t), PROT_READ);
 
 	// update the superblock
-	int result = mprotect(&the_disk->superblock, sizeof(superblock_t), PROT_READ | PROT_WRITE);
+	mprotect(&the_disk->superblock, sizeof(superblock_t), PROT_READ | PROT_WRITE);
 	the_disk->superblock.current_segment = next_segment;
-	msync(&the_disk->superblock, sizeof(superblock_t), MS_ASYNC);
+	msync(&the_disk->superblock, sizeof(superblock_t), MS_SYNC);
 	mprotect(&the_disk->superblock, sizeof(superblock_t), PROT_READ);
 
 	// set up the next segment
@@ -135,11 +127,11 @@ void sync() {
 	next_segment = (next_segment + 1) % SEGMENTS_PER_DISK;
 	next_block = 1;
 	mprotect(&the_disk->segments[next_segment], sizeof(segment_t), PROT_READ | PROT_WRITE);
-	
+
 	// copy in inode map root
 	memcpy(&the_disk->segments[next_segment].blocks[0],
 	       &the_disk->segments[old_segment].blocks[0],
-	       sizeof(data_block_t));
+	       sizeof(block_t));
 
 	// set up segment table
 	block_id_t *segment_table = the_disk->segments[next_segment].segment_table;
@@ -149,7 +141,7 @@ void sync() {
 }
 
 void initialize(char *disk_name, bool format) {
-	int fd = open(disk_name, O_CREAT | O_RDWR, 00600);
+	int fd = open(disk_name, O_CREAT | O_RDWR, 0600);
 	lseek(fd, sizeof(disk_t) - 1, SEEK_SET);
 	write(fd, "", 1);
 
@@ -162,21 +154,49 @@ void initialize(char *disk_name, bool format) {
 	sync();
 }
 
-char *lookup(block_addr_t addr) {
-	if (!addr.non_null)
-		fail("tried to access null disk address");
-	return the_disk->segments[addr.segment].blocks[addr.block];
+/** Managing the logical blocks on the disk ***********************************/
+
+/**
+ * A block_addr is how we store a physical address on disk: it indicates a
+ * segment number and block within that segment.
+ */
+typedef struct block_addr {
+	bool non_null        : 1;
+	unsigned int segment : SEGMENT_NUMBER_BITS;
+	unsigned int block   : BLOCK_NUMBER_BITS;
+} block_addr_t;
+
+#define ADDRS_PER_BLOCK (BYTES_PER_BLOCK/sizeof(block_addr_t)) 
+
+typedef union indirect_block {
+	block_addr_t addrs[ADDRS_PER_BLOCK];
+} indirect_block_t;
+
+/** returns a block_t */
+block_t* lookup(block_addr_t addr) {
+	return &the_disk->segments[addr.segment].blocks[addr.block];
 }
 
-block_addr_t *lookup_indirect(block_addr_t addr) {
-	return (block_addr_t*) lookup(addr);
+/** get block address.  Only used for debugging */
+block_addr_t debug_location(block_t *block) {
+	block_addr_t result;
+
+	if (block == NULL) {
+		result.non_null = false;
+		return result;
+	}
+
+	off_t offset = (void *) block - (void *) the_disk;
+	result.segment = offset / sizeof(segment_t);
+	result.block   = offset % sizeof(segment_t) / sizeof(block_t);
+	return result;
 }
 
 /**
  * If the block identified by id is in the next segment, set result to its
  * location and return true.  Otherwise return false.
  */
-bool dirty(block_id_t id, block_addr_t* result) {
+bool is_dirty(block_id_t id, block_addr_t* result) {
 	block_id_t *segment_table = the_disk->segments[next_segment].segment_table;
 	for (int i = 0; i < BLOCKS_PER_SEGMENT; i++) {
 		if (!segment_table[i].non_null)
@@ -192,49 +212,60 @@ bool dirty(block_id_t id, block_addr_t* result) {
 }
 
 /**
- * Return the address of the given block.  If touch is true, ensure that the
- * returned address is in the next segment, along with all blocks on the path
- * to it.
- *
- * This may cause a sync if there is not enough space in the cache.
+ * Return a pointer to the given block, or NULL if the block doesn't exist
  */
-block_addr_t find(block_id_t id, bool touch) {
-	/* return immediately if cached */
+block_t *find(block_id_t id) {
 	block_addr_t result;
 
-	if (dirty(id, &result))
-		return result;
+	if (is_dirty(id, &result))
+		return lookup(result);
 
-	/* make sure there's space in the cache if necessary */
-	if (touch && next_block + id.depth >= BLOCKS_PER_SEGMENT)
-		sync();
+	indirect_block_t *parent = (indirect_block_t*) find(parent_id(id));
 
-	/* look up this address in the parent */
-	block_id_t parent_id = id;
-	parent_id.depth--;
+	if (parent == NULL)
+		return NULL;
 
-	block_addr_t parent = find(parent_id, touch);
-	result = lookup_indirect(parent)[id.layers[id.depth]];
-
-	if (!touch)
-		return result;
-
-	/* if touching, copy this block into cache and update the parent */ 
-	block_addr_t new_block;
-	new_block.segment = next_segment;
-	new_block.block   = next_block++;
-	if (result.non_null)
-		memcpy(lookup(new_block), lookup(result), sizeof(data_block_t));
+	block_addr_t addr = parent->addrs[id.layers[id.depth]];
+	if (addr.non_null)
+		return lookup(addr);
 	else
-		memset(lookup(new_block), 0, sizeof(data_block_t));
-	lookup_indirect(parent)[id.layers[id.depth]] = new_block;
-	return new_block;
+		return NULL;
 }
 
+/**
+ * Ensure that the given block (and all ancestors) are in the cache, and return
+ * a pointer to its location.  Creates nonexistent blocks as necessary.
+ */
+block_t *touch(block_id_t id) {
+	block_addr_t result;
+
+	if (is_dirty(id, &result))
+		return lookup(result);
+
+	indirect_block_t *parent = (indirect_block_t *) touch(parent_id(id));
+
+	result.non_null = true;
+	result.segment  = next_segment;
+	result.block    = next_block++;
+
+	// TODO: flush if full
+
+	block_addr_t old_addr = parent->addrs[id.layers[id.depth]];
+
+	if (old_addr.non_null)
+		memcpy(lookup(result), lookup(old_addr), sizeof(block_t));
+	else
+		memset(lookup(result), 0, sizeof(block_t));
+
+	the_disk->segments[result.segment].segment_table[result.block] = id;
+	parent->addrs[id.layers[id.depth]] = result;
+
+	return lookup(result);
+}
 
 /** Inodes ********************************************************************/
 
-/** These constants should be chosen so that sizeof(inode_t) <= sizeof(data_block_t) */
+/** These constants should be chosen so that sizeof(inode_t) <= sizeof(block_t) */
 #define N_DIRECT    100
 #define N_SINDIRECT 10
 #define N_DINDIRECT 10
@@ -308,34 +339,28 @@ block_id_t datanum_to_block_id(inode_num_t inode, unsigned long block_num) {
 	return result;
 }
 
-/** User API ******************************************************************/
-
-/*
-void create(inode_num_t file, long size) {
-
-}
-
-void format() {
-
-}
-
-void read(inode_num_t file, long offset, long length, char buffer[length]) {
-	
-}
-
-void write(inode_num_t file, long offset, long length, char buffer[length]) {
-
-}
-
-void delete(inode_num_t file) {
-
-}
-
-*/
-
 int main (int argc, char** argv) {
-	printf("page size: %li\n", sysconf(_SC_PAGE_SIZE));
 	initialize("disk.lfs", true);
+
+	block_id_t root_id;
+	root_id.non_null = true;
+	root_id.depth    = 0;
+
+	block_t *root  = find(root_id); 
+	block_addr_t loc = debug_location(root);
+	printf("root:  s%i  b%i \n", loc.segment, loc.block);
+	printf("*root: \"%s\"\n", root->bytes);
+	printf("\n");
+
+	root = touch(root_id);
+	loc  = debug_location(root);
+	printf("root:  s%i  b%i \n", loc.segment, loc.block);
+	printf("*root:    %s\n", root->bytes);
+	printf("\n");
+
+	strcpy(root->bytes, "hello world\0");
+	sync();
+
 	return 0;
 }
 
@@ -346,3 +371,5 @@ void fail(char *msg) {
 	printf("quitting.");
 	exit(1);
 }
+
+
