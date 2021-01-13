@@ -31,8 +31,13 @@ typedef struct block_id {
 	unsigned char layers[7]; // inode # / inode # / inode # / triple # / double # / single # / data #
 } block_id_t;
 
+/** Compare two block ids for equality */
 extern bool block_id_eq(block_id_t a, block_id_t b);
+
+/** Return the id of the block that references this block */
 extern block_id_t parent_id(block_id_t id);
+
+/** Output the block id in a human-readable format */
 extern void print_block_id(block_id_t id);
 
 /*******************************************************************************
@@ -74,7 +79,7 @@ typedef struct metadata {
 } metadata_t;
 
 typedef struct inode {
-	// must be first; we cast this to an indirect block for easy lookup
+	// blocks must be first; we cast this to an indirect block for easy lookup
 	block_addr_t blocks[N_DIRECT + N_SINDIRECT + N_DINDIRECT + N_TINDIRECT];
 	metadata_t metadata;
 } inode_t;
